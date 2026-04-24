@@ -24,8 +24,10 @@ pub fn install_fake_patch(patch_number: usize) -> anyhow::Result<()> {
             &PatchInfo {
                 path: artifact_path,
                 number: patch_number,
+                assets_dir: None,
             },
             "hash",
+            None,
             None,
         )?;
         state.save()

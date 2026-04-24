@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::events::PatchEvent;
 use crate::yaml::PatchVerificationMode;
 
-use super::patch_manager::{ManagePatches, PatchManager};
+use super::patch_manager::{AssetsInstall, ManagePatches, PatchManager};
 use super::{disk_io, PatchInfo};
 
 /// Where the updater state is stored on disk.
@@ -264,9 +264,10 @@ impl UpdaterState {
         patch: &PatchInfo,
         hash: &str,
         signature: Option<&str>,
+        assets: Option<AssetsInstall>,
     ) -> anyhow::Result<()> {
         self.patch_manager
-            .add_patch(patch.number, &patch.path, hash, signature)
+            .add_patch(patch.number, &patch.path, hash, signature, assets)
     }
 
     /// Removes the artifacts for patch `patch_number` from disk and updates state to ensure the
@@ -334,7 +335,11 @@ mod tests {
     fn fake_patch(tmp_dir: &TempDir, number: usize) -> super::PatchInfo {
         let path = tmp_dir.path().join(format!("patch_{}", number));
         std::fs::write(&path, "fake patch").unwrap();
-        PatchInfo { number, path }
+        PatchInfo {
+            number,
+            path,
+            assets_dir: None,
+        }
     }
 
     #[test]
@@ -343,7 +348,7 @@ mod tests {
         let mut patch_manager = PatchManager::manager_for_test(&tmp_dir);
         let file_path = &tmp_dir.path().join("patch1.vmcode");
         std::fs::write(file_path, "patch file contents").unwrap();
-        assert!(patch_manager.add_patch(1, file_path, "hash", None).is_ok());
+        assert!(patch_manager.add_patch(1, file_path, "hash", None, None).is_ok());
 
         let state = test_state(&tmp_dir, patch_manager);
         let release_version = state.serialized_state.release_version.clone();
@@ -550,17 +555,18 @@ mod tests {
         let cloned_patch = patch.clone();
         mock_manage_patches
             .expect_add_patch()
-            .withf(move |number, path, hash, signature| {
+            .withf(move |number, path, hash, signature, assets| {
                 number == &cloned_patch.number
                     && path == cloned_patch.path
                     && hash == "hash"
                     && signature == &Some("signature")
+                    && assets.is_none()
             })
-            .returning(|_, __, ___, ____| Ok(()));
+            .returning(|_, _, _, _, _| Ok(()));
         let mut state = test_state(&tmp_dir, mock_manage_patches);
 
         assert!(state
-            .install_patch(&patch, "hash", Some("signature"))
+            .install_patch(&patch, "hash", Some("signature"), None)
             .is_ok());
     }
 
@@ -593,7 +599,7 @@ mod tests {
             PatchVerificationMode::default(),
         );
         let patch = fake_patch(&tmp_dir, 1);
-        state.install_patch(&patch, "hash", None)?;
+        state.install_patch(&patch, "hash", None, None)?;
         state.save()?;
         assert_eq!(state.next_boot_patch().unwrap().number, 1);
 

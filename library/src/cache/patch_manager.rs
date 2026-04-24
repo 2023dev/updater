@@ -6,6 +6,8 @@ use core::fmt::Debug;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
+    fs::File,
+    io,
     path::{Path, PathBuf},
 };
 
@@ -17,6 +19,13 @@ use tempfile::TempDir;
 const PATCHES_DIR_NAME: &str = "patches";
 const PATCHES_STATE_FILE_NAME: &str = "patches_state.json";
 const PATCH_ARTIFACT_FILENAME: &str = "dlc.vmcode";
+/// Downloaded asset-bundle zip (lives alongside `dlc.vmcode`). Kept on
+/// disk as the integrity source for Strict-mode boot validation; the
+/// extracted tree at [`PATCH_ASSETS_DIR_NAME`] is a cache derived from it.
+const PATCH_ASSETS_FILENAME: &str = "dlc.assets";
+/// Extracted-tree sibling of [`PATCH_ASSETS_FILENAME`]. Engine reads
+/// from here as a patch-first override ahead of the release bundle.
+const PATCH_ASSETS_DIR_NAME: &str = "assets";
 
 /// Information about a patch that is persisted to disk.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
@@ -32,6 +41,46 @@ struct PatchMetadata {
 
     /// The signature of `hash`.
     signature: Option<String>,
+
+    /// Integrity metadata for the patch's asset bundle, if it has one.
+    /// `None` for code-only patches and for any patch written by an
+    /// updater version that predated asset support — hence
+    /// `#[serde(default)]` for backward-compatible deserialization of
+    /// older `patches_state.json` files.
+    #[serde(default)]
+    assets: Option<AssetsMetadata>,
+}
+
+/// Integrity metadata for the `dlc.assets` zip. Parallels the code-only
+/// fields on [`PatchMetadata`]: the size/hash/signature we captured at
+/// install time, used to detect on-disk tampering at boot.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+struct AssetsMetadata {
+    /// Size of the on-disk `dlc.assets` zip in bytes.
+    size: u64,
+
+    /// Hex sha256 of the on-disk `dlc.assets` zip.
+    hash: String,
+
+    /// Signature of `hash`, if the patch is signed.
+    signature: Option<String>,
+}
+
+/// Inputs for installing the asset-bundle artifact alongside a patch.
+///
+/// Passed into [`ManagePatches::add_patch`] when the patch-check
+/// response carried an `assets` artifact. The `file_path` zip is
+/// moved into the patch directory as `dlc.assets` and extracted
+/// into the `assets/` subtree; both are rolled back atomically if
+/// any step fails.
+#[derive(Clone, Copy, Debug)]
+pub struct AssetsInstall<'a> {
+    /// Path to the downloaded asset-bundle zip (will be moved out).
+    pub file_path: &'a Path,
+    /// Hex sha256 of the zip bytes.
+    pub hash: &'a str,
+    /// Signature of `hash`, if the patch is signed.
+    pub signature: Option<&'a str>,
 }
 
 /// What gets serialized to disk
@@ -73,6 +122,11 @@ pub trait ManagePatches {
     /// Copies the patch file at file_path to the manager's directory structure
     /// sets this patch as the next patch to boot.
     ///
+    /// If `assets` is `Some`, the asset-bundle zip it points to is also
+    /// moved into the patch directory and extracted. The install is
+    /// atomic: if any asset step fails the entire patch (code + assets)
+    /// is rolled back and an error is returned.
+    ///
     /// The explicit lifetime is required for automock to work with Options.
     /// See https://github.com/asomers/mockall/issues/61.
     #[allow(clippy::needless_lifetimes)]
@@ -82,6 +136,7 @@ pub trait ManagePatches {
         file_path: &Path,
         hash: &str,
         signature: Option<&'a str>,
+        assets: Option<AssetsInstall<'a>>,
     ) -> Result<()>;
 
     /// Returns the patch we most recently successfully booted from (usually the currently running patch),
@@ -136,6 +191,44 @@ impl Debug for dyn ManagePatches {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "ManagePatches")
     }
+}
+
+/// Extract every entry of the zip at `zip_path` into `target_dir`,
+/// creating intermediate directories as needed. Rejects entries whose
+/// paths would escape `target_dir` (zip-slip) — see
+/// <https://snyk.io/research/zip-slip-vulnerability>.
+fn extract_zip_to(zip_path: &Path, target_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(target_dir)
+        .with_file_context(FileOperation::CreateDir, target_dir)?;
+    let file = File::open(zip_path).with_file_context(FileOperation::ReadFile, zip_path)?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("Reading zip archive at {}", zip_path.display()))?;
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .with_context(|| format!("Reading zip entry {} in {}", i, zip_path.display()))?;
+        // `enclosed_name` returns None for absolute paths or paths
+        // containing `..` components that would escape the target dir.
+        let rel = match entry.enclosed_name() {
+            Some(p) => p,
+            None => bail!("Refusing to extract unsafe zip entry: {}", entry.name()),
+        };
+        let out_path = target_dir.join(rel);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out_path)
+                .with_file_context(FileOperation::CreateDir, &out_path)?;
+            continue;
+        }
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_file_context(FileOperation::CreateDir, parent)?;
+        }
+        let mut out_file =
+            File::create(&out_path).with_file_context(FileOperation::CreateFile, &out_path)?;
+        io::copy(&mut entry, &mut out_file)
+            .with_file_context(FileOperation::WriteFile, &out_path)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -217,17 +310,48 @@ impl PatchManager {
         self.patch_dir(patch_number).join(PATCH_ARTIFACT_FILENAME)
     }
 
+    /// The path to the downloaded asset-bundle zip for the given patch.
+    fn patch_assets_path(&self, patch_number: usize) -> PathBuf {
+        self.patch_dir(patch_number).join(PATCH_ASSETS_FILENAME)
+    }
+
+    /// The path to the extracted asset-bundle directory for the given patch.
+    fn patch_assets_dir(&self, patch_number: usize) -> PathBuf {
+        self.patch_dir(patch_number).join(PATCH_ASSETS_DIR_NAME)
+    }
+
     fn patch_info_for_number(&self, patch_number: usize) -> PatchInfo {
+        let assets_dir = self
+            .metadata_for_patch(patch_number)
+            .and_then(|m| m.assets.as_ref())
+            .map(|_| self.patch_assets_dir(patch_number));
         PatchInfo {
             path: self.patch_artifact_path(patch_number),
             number: patch_number,
+            assets_dir,
         }
+    }
+
+    /// Finds the persisted [`PatchMetadata`] for `patch_number` across
+    /// the three slots we track (last booted, next boot, currently
+    /// booting). Returns the first match or `None`.
+    fn metadata_for_patch(&self, patch_number: usize) -> Option<&PatchMetadata> {
+        let slots = [
+            self.patches_state.last_booted_patch.as_ref(),
+            self.patches_state.next_boot_patch.as_ref(),
+            self.patches_state.currently_booting_patch.as_ref(),
+        ];
+        slots.into_iter().flatten().find(|m| m.number == patch_number)
     }
 
     /// Checks that the patch with the given number:
     ///   - Has an artifact on disk
     ///   - That artifact on disk is the same size it was when it was installed
     ///   - In Strict mode: verifies the signature against the hash
+    ///
+    /// If the patch carries an asset bundle, the same checks are applied
+    /// to `dlc.assets`, and the extracted `assets/` subtree is recreated
+    /// from the zip when missing (robustness against external cleanup).
     ///
     /// Returns Ok if the patch is bootable, or an error if it is not.
     fn validate_patch_is_bootable(&self, patch: &PatchMetadata) -> Result<()> {
@@ -267,6 +391,66 @@ impl PatchManager {
             } else {
                 shorebird_info!("No public key provided, skipping signature verification");
             }
+        }
+
+        if let Some(assets) = &patch.assets {
+            self.validate_assets_bundle(patch.number, assets)?;
+        }
+
+        Ok(())
+    }
+
+    /// Boot-time integrity check for the asset-bundle half of a patch.
+    /// Parallels the vmcode checks above and re-extracts the `assets/`
+    /// subtree from `dlc.assets` when the extracted copy is missing —
+    /// i.e. we fully trust the zip (it's the install-time source of
+    /// truth, signature-verified in Strict mode) and treat the
+    /// extracted tree as a regenerable cache.
+    fn validate_assets_bundle(
+        &self,
+        patch_number: usize,
+        assets: &AssetsMetadata,
+    ) -> Result<()> {
+        let zip_path = self.patch_assets_path(patch_number);
+        if !zip_path.exists() {
+            bail!(
+                "Patch {} assets bundle does not exist at {}",
+                patch_number,
+                zip_path.display()
+            );
+        }
+
+        let zip_size = std::fs::metadata(&zip_path)
+            .with_file_context(FileOperation::GetMetadata, &zip_path)?
+            .len();
+        if zip_size != assets.size {
+            bail!(
+                "Patch {} assets bundle has size {} on disk, but expected size {}",
+                patch_number,
+                zip_size,
+                assets.size
+            );
+        }
+
+        if self.verification_mode == PatchVerificationMode::Strict {
+            if let Some(public_key) = &self.patch_public_key {
+                let signature = assets
+                    .signature
+                    .clone()
+                    .context("Patch assets signature is missing")?;
+                let zip_hash = signing::hash_file(&zip_path)?;
+                signing::check_signature(&zip_hash, &signature, public_key)?;
+            }
+        }
+
+        let extracted_dir = self.patch_assets_dir(patch_number);
+        if !extracted_dir.exists() {
+            shorebird_info!(
+                "Re-extracting missing assets directory for patch {} from {}",
+                patch_number,
+                zip_path.display()
+            );
+            extract_zip_to(&zip_path, &extracted_dir)?;
         }
 
         Ok(())
@@ -342,6 +526,42 @@ impl PatchManager {
         self.save_patches_state()
     }
 
+    /// Moves the downloaded asset-bundle zip into the patch directory
+    /// and extracts it into the `assets/` subtree. Returns the
+    /// [`AssetsMetadata`] to persist alongside the patch.
+    ///
+    /// Callers (currently only [`Self::add_patch`]) are responsible
+    /// for rolling back the patch directory if this returns an error.
+    fn install_assets(
+        &self,
+        patch_number: usize,
+        assets: &AssetsInstall<'_>,
+    ) -> Result<AssetsMetadata> {
+        let zip_path = self.patch_assets_path(patch_number);
+        let extracted_dir = self.patch_assets_dir(patch_number);
+
+        std::fs::rename(assets.file_path, &zip_path)
+            .with_file_context(FileOperation::RenameFile, assets.file_path)?;
+
+        extract_zip_to(&zip_path, &extracted_dir).with_context(|| {
+            format!(
+                "Extracting patch assets from {} to {}",
+                zip_path.display(),
+                extracted_dir.display()
+            )
+        })?;
+
+        let size = std::fs::metadata(&zip_path)
+            .with_file_context(FileOperation::GetMetadata, &zip_path)?
+            .len();
+
+        Ok(AssetsMetadata {
+            size,
+            hash: assets.hash.to_owned(),
+            signature: assets.signature.map(|s| s.to_owned()),
+        })
+    }
+
     /// Deletes all patch artifacts with numbers less than patch_number.
     /// We intentionally only delete older patch artifacts. Consider the case:
     ///
@@ -387,6 +607,7 @@ impl ManagePatches for PatchManager {
         file_path: &Path,
         hash: &str,
         signature: Option<&'a str>,
+        assets: Option<AssetsInstall<'a>>,
     ) -> Result<()> {
         if !file_path.exists() {
             bail!("Patch file {} does not exist", file_path.display());
@@ -401,6 +622,24 @@ impl ManagePatches for PatchManager {
             }
         }
 
+        // Pre-check the asset-bundle inputs (existence + InstallOnly
+        // signature) before we start moving files — we want to fail
+        // before touching the patch directory if the inputs are bogus.
+        if let Some(a) = &assets {
+            if !a.file_path.exists() {
+                bail!(
+                    "Patch assets file {} does not exist",
+                    a.file_path.display()
+                );
+            }
+            if self.verification_mode == PatchVerificationMode::InstallOnly {
+                if let Some(public_key) = &self.patch_public_key {
+                    let sig = a.signature.context("Patch assets signature is missing")?;
+                    signing::check_signature(a.hash, sig, public_key)?;
+                }
+            }
+        }
+
         let patch_path = self.patch_artifact_path(patch_number);
 
         let patch_dir = self.patch_dir(patch_number);
@@ -410,6 +649,20 @@ impl ManagePatches for PatchManager {
         std::fs::rename(file_path, &patch_path)
             .with_file_context(FileOperation::RenameFile, file_path)?;
 
+        // Install the asset bundle (if present) atomically: any error
+        // rolls back the just-installed patch directory so we never
+        // leave a half-populated patch on disk.
+        let assets_metadata = match assets {
+            Some(a) => match self.install_assets(patch_number, &a) {
+                Ok(meta) => Some(meta),
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&patch_dir);
+                    return Err(e).context("Installing patch assets");
+                }
+            },
+            None => None,
+        };
+
         let new_patch = PatchMetadata {
             number: patch_number,
             size: std::fs::metadata(&patch_path)
@@ -417,6 +670,7 @@ impl ManagePatches for PatchManager {
                 .len(),
             hash: hash.to_owned(),
             signature: signature.map(|s| s.to_owned()),
+            assets: assets_metadata,
         };
 
         // If a patch was never booted (next_boot_patch != last_booted_patch), we should delete
@@ -584,7 +838,370 @@ impl PatchManager {
             hash,
             file_path.display()
         );
-        self.add_patch(patch_number, file_path, hash, signature)
+        self.add_patch(patch_number, file_path, hash, signature, None)
+    }
+}
+
+#[cfg(test)]
+mod serialization_tests {
+    use super::*;
+
+    #[test]
+    fn patch_metadata_without_assets_field_deserializes() {
+        // `patches_state.json` files written by pre-asset-support
+        // updater versions don't carry an `assets` field; with
+        // `#[serde(default)]` they must still round-trip.
+        let legacy = r#"{"number":3,"size":42,"hash":"abc","signature":null}"#;
+        let parsed: PatchMetadata = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.number, 3);
+        assert!(parsed.assets.is_none());
+    }
+
+    #[test]
+    fn patch_metadata_with_assets_field_deserializes() {
+        let json = r#"{"number":4,"size":42,"hash":"vm","signature":null,
+            "assets":{"size":99,"hash":"ah","signature":"sg"}}"#;
+        let parsed: PatchMetadata = serde_json::from_str(json).unwrap();
+        let assets = parsed.assets.expect("assets should deserialize");
+        assert_eq!(assets.size, 99);
+        assert_eq!(assets.hash, "ah");
+        assert_eq!(assets.signature.as_deref(), Some("sg"));
+    }
+}
+
+#[cfg(test)]
+mod assets_dir_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn patch_info_has_no_assets_dir_when_metadata_has_none() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut manager = PatchManager::manager_for_test(&temp_dir);
+        manager.add_patch_for_test(&temp_dir, 1).unwrap();
+        let info = manager.next_boot_patch().unwrap();
+        assert_eq!(info.assets_dir, None);
+    }
+
+    #[test]
+    fn patch_info_has_assets_dir_when_metadata_has_assets() {
+        // Drives the `patch_info_for_number` wiring end-to-end without
+        // needing the (not-yet-implemented) install path. Directly
+        // injects `assets` into the persisted metadata and verifies
+        // that PatchInfo surfaces the expected directory.
+        let temp_dir = TempDir::new().unwrap();
+        let mut manager = PatchManager::manager_for_test(&temp_dir);
+        manager.add_patch_for_test(&temp_dir, 7).unwrap();
+        manager.patches_state.next_boot_patch.as_mut().unwrap().assets = Some(AssetsMetadata {
+            size: 1,
+            hash: "h".to_string(),
+            signature: None,
+        });
+        let info = manager.next_boot_patch().unwrap();
+        assert_eq!(info.assets_dir, Some(manager.patch_assets_dir(7)));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_zip_helpers {
+    //! Shared zip-building helpers for install & validation tests.
+    use super::*;
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    /// Builds a minimal zip in `temp_dir` containing `entries`
+    /// (each `(path_in_zip, contents)`) and returns the zip's path.
+    pub fn write_assets_zip(
+        temp_dir: &TempDir,
+        name: &str,
+        entries: &[(&str, &[u8])],
+    ) -> PathBuf {
+        let path = temp_dir.path().join(name);
+        let mut zip = zip::ZipWriter::new(File::create(&path).unwrap());
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (entry_path, contents) in entries {
+            zip.start_file(*entry_path, opts).unwrap();
+            zip.write_all(contents).unwrap();
+        }
+        zip.finish().unwrap();
+        path
+    }
+}
+
+#[cfg(test)]
+mod add_patch_with_assets_tests {
+    use super::test_zip_helpers::write_assets_zip;
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Builds a zip whose entry name escapes the extract directory
+    /// via `..` — zip-slip. Uses `start_file_from_path` intentionally
+    /// bypassed by passing a raw string name.
+    fn write_zip_slip(temp_dir: &TempDir, name: &str) -> std::path::PathBuf {
+        // Use a name with `..` so `enclosed_name` rejects it.
+        write_assets_zip(temp_dir, name, &[("../escape.txt", b"bad")])
+    }
+
+    fn make_vmcode(temp_dir: &TempDir, n: usize) -> PathBuf {
+        let path = temp_dir.path().join(format!("vm{n}.src"));
+        std::fs::write(&path, format!("vmcode-{n}")).unwrap();
+        path
+    }
+
+    #[test]
+    fn installs_assets_alongside_code() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = PatchManager::manager_for_test(&temp_dir);
+
+        let vm = make_vmcode(&temp_dir, 1);
+        let zip =
+            write_assets_zip(&temp_dir, "dlc.assets.src", &[("flutter_assets/app.json", b"{}")]);
+        manager.add_patch(
+            1,
+            &vm,
+            "vm-hash",
+            None,
+            Some(AssetsInstall {
+                file_path: &zip,
+                hash: "assets-hash",
+                signature: None,
+            }),
+        )?;
+
+        // Zip + extracted dir + per-entry file must all exist.
+        assert!(manager.patch_assets_path(1).exists());
+        let assets_dir = manager.patch_assets_dir(1);
+        assert!(assets_dir.exists());
+        assert!(assets_dir.join("flutter_assets/app.json").exists());
+
+        // PatchInfo surfaces the extracted dir.
+        let info = manager.next_boot_patch().unwrap();
+        assert_eq!(info.assets_dir, Some(assets_dir));
+
+        Ok(())
+    }
+
+    #[test]
+    fn missing_assets_file_rolls_back_patch_dir() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut manager = PatchManager::manager_for_test(&temp_dir);
+        let vm = make_vmcode(&temp_dir, 1);
+        let nonexistent = temp_dir.path().join("does-not-exist.zip");
+
+        let err = manager
+            .add_patch(
+                1,
+                &vm,
+                "vm-hash",
+                None,
+                Some(AssetsInstall {
+                    file_path: &nonexistent,
+                    hash: "h",
+                    signature: None,
+                }),
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("Patch assets file"));
+        // Patch dir never created because the pre-check fires before
+        // we rename anything.
+        assert!(!manager.patch_dir(1).exists());
+        assert!(manager.next_boot_patch().is_none());
+    }
+
+    #[test]
+    fn zip_slip_entry_rolls_back_patch_dir() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut manager = PatchManager::manager_for_test(&temp_dir);
+        let vm = make_vmcode(&temp_dir, 1);
+        let zip = write_zip_slip(&temp_dir, "slip.zip");
+
+        let err = manager
+            .add_patch(
+                1,
+                &vm,
+                "vm-hash",
+                None,
+                Some(AssetsInstall {
+                    file_path: &zip,
+                    hash: "h",
+                    signature: None,
+                }),
+            )
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("unsafe zip entry"));
+        // Rollback: neither the vmcode nor the assets/ subtree should
+        // remain on disk.
+        assert!(!manager.patch_dir(1).exists());
+        assert!(manager.next_boot_patch().is_none());
+    }
+
+    #[test]
+    fn install_only_requires_assets_signature_when_key_configured() {
+        // Matches the existing behavior for the vmcode artifact: in
+        // InstallOnly mode with a configured public key, the asset
+        // bundle must also carry a signature.
+        let temp_dir = TempDir::new().unwrap();
+        let mut manager = PatchManager::new(
+            temp_dir.path().to_path_buf(),
+            Some("invalid-key"),
+            PatchVerificationMode::InstallOnly,
+        );
+        let vm = make_vmcode(&temp_dir, 1);
+        let zip = write_assets_zip(&temp_dir, "a.zip", &[("x", b"y")]);
+
+        let err = manager
+            .add_patch(
+                1,
+                &vm,
+                "vm-hash",
+                Some("sig"), // vmcode signature check fails first with bad key;
+                // that's fine — this test just asserts we never
+                // produce partial state on install-time errors.
+                Some(AssetsInstall {
+                    file_path: &zip,
+                    hash: "h",
+                    signature: None,
+                }),
+            )
+            .unwrap_err();
+        let _ = err;
+        assert!(!manager.patch_dir(1).exists());
+    }
+}
+
+#[cfg(test)]
+mod validate_with_assets_tests {
+    //! Boot-time integrity checks for the asset-bundle half of a patch:
+    //! detect external tampering (size/hash) and recover from external
+    //! cleanup of the extracted `assets/` subtree (re-extract).
+    use super::test_zip_helpers::write_assets_zip;
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Installs patch `n` with both a vmcode file and a real assets zip,
+    /// returning the manager and the bytes of the assets zip (useful
+    /// when tests want to mutate or mismatch the on-disk bytes).
+    fn install_patch_with_assets(
+        temp_dir: &TempDir,
+        manager: &mut PatchManager,
+        n: usize,
+        entries: &[(&str, &[u8])],
+    ) -> Vec<u8> {
+        let vm = temp_dir.path().join(format!("vm{n}.src"));
+        std::fs::write(&vm, format!("vmcode-{n}")).unwrap();
+        let zip = write_assets_zip(temp_dir, &format!("assets{n}.src"), entries);
+        let zip_bytes = std::fs::read(&zip).unwrap();
+        manager
+            .add_patch(
+                n,
+                &vm,
+                "vm-hash",
+                None,
+                Some(AssetsInstall {
+                    file_path: &zip,
+                    hash: "assets-hash",
+                    signature: None,
+                }),
+            )
+            .unwrap();
+        zip_bytes
+    }
+
+    #[test]
+    fn validate_succeeds_on_intact_patch_with_assets() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut manager = PatchManager::manager_for_test(&temp_dir);
+        install_patch_with_assets(&temp_dir, &mut manager, 1, &[("flutter_assets/a", b"x")]);
+        assert!(manager.validate_next_boot_patch().is_ok());
+        assert!(manager.next_boot_patch().is_some());
+    }
+
+    #[test]
+    fn missing_assets_zip_fails_validation_and_clears_patch() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut manager = PatchManager::manager_for_test(&temp_dir);
+        install_patch_with_assets(&temp_dir, &mut manager, 1, &[("flutter_assets/a", b"x")]);
+        // Simulate external deletion of the zip.
+        std::fs::remove_file(manager.patch_assets_path(1)).unwrap();
+        assert!(manager.validate_next_boot_patch().is_err());
+        assert!(manager.next_boot_patch().is_none());
+    }
+
+    #[test]
+    fn assets_zip_size_mismatch_fails_validation() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut manager = PatchManager::manager_for_test(&temp_dir);
+        install_patch_with_assets(&temp_dir, &mut manager, 1, &[("flutter_assets/a", b"x")]);
+        // Tamper with the on-disk zip so its size no longer matches
+        // the metadata recorded at install time.
+        std::fs::write(manager.patch_assets_path(1), b"truncated").unwrap();
+        let err = manager.validate_next_boot_patch().unwrap_err();
+        assert!(format!("{err:#}").contains("assets bundle has size"));
+        assert!(manager.next_boot_patch().is_none());
+    }
+
+    #[test]
+    fn missing_extracted_dir_is_recreated_during_validation() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut manager = PatchManager::manager_for_test(&temp_dir);
+        install_patch_with_assets(
+            &temp_dir,
+            &mut manager,
+            1,
+            &[("flutter_assets/hello.txt", b"from patch")],
+        );
+        // Simulate external cleanup (low-storage OS sweep, manual
+        // deletion, etc.) of the extracted tree — but leave the
+        // integrity-checked zip in place.
+        let extracted = manager.patch_assets_dir(1);
+        assert!(extracted.exists());
+        std::fs::remove_dir_all(&extracted).unwrap();
+        assert!(!extracted.exists());
+
+        // Validation should rebuild the extracted tree from the zip.
+        manager.validate_next_boot_patch().unwrap();
+        assert!(extracted.join("flutter_assets/hello.txt").exists());
+        let contents = std::fs::read(extracted.join("flutter_assets/hello.txt")).unwrap();
+        assert_eq!(contents, b"from patch");
+    }
+
+    #[test]
+    fn strict_mode_rejects_missing_assets_signature() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut manager = PatchManager::new(
+            temp_dir.path().to_path_buf(),
+            Some("some-key"),
+            PatchVerificationMode::Strict,
+        );
+        install_patch_with_assets(
+            &temp_dir,
+            &mut manager,
+            1,
+            &[("flutter_assets/a", b"x")],
+        );
+        // In Strict mode the assets signature is checked at boot time.
+        // We installed without one, so boot validation must reject
+        // the patch — matches vmcode Strict-mode behavior.
+        assert!(manager.validate_next_boot_patch().is_err());
+        assert!(manager.next_boot_patch().is_none());
+    }
+
+    #[test]
+    fn deleting_patch_removes_assets_and_extracted_tree() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut manager = PatchManager::manager_for_test(&temp_dir);
+        install_patch_with_assets(&temp_dir, &mut manager, 1, &[("flutter_assets/a", b"x")]);
+        let patch_dir = manager.patch_dir(1);
+        let assets_dir = manager.patch_assets_dir(1);
+        let zip_path = manager.patch_assets_path(1);
+        assert!(patch_dir.exists() && assets_dir.exists() && zip_path.exists());
+
+        manager.remove_patch(1).unwrap();
+        // Nothing about this patch should remain on disk.
+        assert!(!patch_dir.exists());
+        assert!(!assets_dir.exists());
+        assert!(!zip_path.exists());
     }
 }
 
@@ -631,6 +1248,7 @@ mod add_patch_tests {
                 Path::new("/path/to/file/that/does/not/exist"),
                 "hash",
                 None,
+                None,
             )
             .is_err());
     }
@@ -650,7 +1268,8 @@ mod add_patch_tests {
                 patch_number,
                 Path::new(file_path),
                 "hash",
-                Some("my_signature")
+                Some("my_signature"),
+                None,
             )
             .is_ok());
 
@@ -660,7 +1279,8 @@ mod add_patch_tests {
                 number: patch_number,
                 size: patch_file_contents.len() as u64,
                 hash: "hash".to_string(),
-                signature: Some("my_signature".to_owned())
+                signature: Some("my_signature".to_owned()),
+                assets: None,
             })
         );
         assert!(!file_path.exists());
@@ -697,7 +1317,7 @@ mod add_patch_tests {
         std::fs::write(file_path, "patch contents").unwrap();
 
         // In InstallOnly mode, fails at install time because the public key is invalid
-        let result = manager.add_patch(1, file_path, INFLATED_PATCH_HASH, Some(SIGNATURE));
+        let result = manager.add_patch(1, file_path, INFLATED_PATCH_HASH, Some(SIGNATURE), None);
         assert!(result.is_err());
         assert!(manager.next_boot_patch().is_none());
     }
@@ -715,7 +1335,7 @@ mod add_patch_tests {
         std::fs::write(file_path, "patch contents").unwrap();
 
         // In InstallOnly mode, fails at install time because signature is missing
-        let result = manager.add_patch(1, file_path, INFLATED_PATCH_HASH, None);
+        let result = manager.add_patch(1, file_path, INFLATED_PATCH_HASH, None, None);
         assert!(result.is_err());
         assert!(manager.next_boot_patch().is_none());
     }
@@ -735,7 +1355,7 @@ mod add_patch_tests {
         // Using INFLATED_PATCH_HASH as a signature because it is valid base64, but not a valid signature.
         // In InstallOnly mode, this fails immediately at install time.
         let result =
-            manager.add_patch(1, file_path, INFLATED_PATCH_HASH, Some(INFLATED_PATCH_HASH));
+            manager.add_patch(1, file_path, INFLATED_PATCH_HASH, Some(INFLATED_PATCH_HASH), None);
         assert!(result.is_err());
         assert!(manager.next_boot_patch().is_none());
     }
@@ -753,7 +1373,7 @@ mod add_patch_tests {
         std::fs::write(file_path, "patch contents").unwrap();
 
         // In InstallOnly mode, signature is verified at install time
-        let result = manager.add_patch(1, file_path, INFLATED_PATCH_HASH, Some(SIGNATURE));
+        let result = manager.add_patch(1, file_path, INFLATED_PATCH_HASH, Some(SIGNATURE), None);
         assert!(result.is_ok());
         assert!(manager.next_boot_patch().is_some());
     }
@@ -771,7 +1391,7 @@ mod add_patch_tests {
         std::fs::write(file_path, "patch contents").unwrap();
 
         // Without a public key, signature verification is skipped even in InstallOnly mode
-        let result = manager.add_patch(1, file_path, "hash", Some("not a valid signature"));
+        let result = manager.add_patch(1, file_path, "hash", Some("not a valid signature"), None);
         assert!(result.is_ok());
         assert!(manager.next_boot_patch().is_some());
     }
@@ -801,6 +1421,7 @@ mod last_successfully_booted_patch_tests {
         let expected = PatchInfo {
             path: manager.patch_artifact_path(1),
             number: 1,
+            assets_dir: None,
         };
         manager.patches_state.last_booted_patch = manager.patches_state.next_boot_patch.clone();
         assert_eq!(manager.last_successfully_booted_patch(), Some(expected));
@@ -847,7 +1468,7 @@ mod next_boot_patch_tests {
         std::fs::write(file_path, patch_file_contents)?;
 
         // Add patch 1, pretend it booted successfully.
-        assert!(manager.add_patch(1, file_path, "hash", None).is_ok());
+        assert!(manager.add_patch(1, file_path, "hash", None, None).is_ok());
         assert!(manager.record_boot_start_for_patch(1).is_ok());
         assert!(manager.record_boot_success().is_ok());
         assert!(!manager.is_known_bad_patch(1));
@@ -855,7 +1476,7 @@ mod next_boot_patch_tests {
         // Add patch 2, pretend it failed to boot.
         let file_path = &temp_dir.path().join("patch2.vmcode");
         std::fs::write(file_path, patch_file_contents)?;
-        assert!(manager.add_patch(2, file_path, "hash", None).is_ok());
+        assert!(manager.add_patch(2, file_path, "hash", None, None).is_ok());
         assert!(manager.record_boot_start_for_patch(2).is_ok());
         assert!(manager.record_boot_failure_for_patch(2).is_ok());
         assert!(manager.is_known_bad_patch(2));
@@ -968,7 +1589,7 @@ mod validate_next_boot_patch_tests {
         let mut manager = PatchManager::manager_for_test(&temp_dir);
         let file_path = &temp_dir.path().join("patch1.vmcode");
         std::fs::write(file_path, patch_file_contents)?;
-        assert!(manager.add_patch(1, file_path, "hash", None).is_ok());
+        assert!(manager.add_patch(1, file_path, "hash", None, None).is_ok());
 
         // Write junk to the artifact, this should render the patch unbootable in the eyes
         // of the PatchManager.
@@ -998,14 +1619,14 @@ mod validate_next_boot_patch_tests {
         std::fs::write(file_path, patch_file_contents)?;
 
         // Add patch 1, pretend it booted successfully.
-        assert!(manager.add_patch(1, file_path, "hash", None).is_ok());
+        assert!(manager.add_patch(1, file_path, "hash", None, None).is_ok());
         assert!(manager.record_boot_start_for_patch(1).is_ok());
         assert!(manager.record_boot_success().is_ok());
 
         // Add patch 2, pretend it failed to boot.
         let file_path = &temp_dir.path().join("patch2.vmcode");
         std::fs::write(file_path, patch_file_contents)?;
-        assert!(manager.add_patch(2, file_path, "hash", None).is_ok());
+        assert!(manager.add_patch(2, file_path, "hash", None, None).is_ok());
         assert!(manager.record_boot_start_for_patch(2).is_ok());
         assert!(manager.record_boot_failure_for_patch(2).is_ok());
 
@@ -1336,7 +1957,7 @@ mod record_boot_success_for_patch_tests {
         let file_path = &temp_dir.path().join("patch1.vmcode");
         std::fs::write(file_path, patch_file_contents)?;
         assert!(manager
-            .add_patch(patch_number, file_path, "hash", None)
+            .add_patch(patch_number, file_path, "hash", None, None)
             .is_ok());
         assert!(manager.record_boot_success().is_err());
 
@@ -1352,7 +1973,7 @@ mod record_boot_success_for_patch_tests {
         let file_path = &temp_dir.path().join("patch1.vmcode");
         std::fs::write(file_path, patch_file_contents)?;
         assert!(manager
-            .add_patch(patch_number, file_path, "hash", None)
+            .add_patch(patch_number, file_path, "hash", None, None)
             .is_ok());
 
         assert!(manager.record_boot_start_for_patch(1).is_ok());

@@ -9,7 +9,7 @@ use crate::file_errors::{FileOperation, IoResultExt};
 use anyhow::{bail, Context, Result};
 use dyn_clone::DynClone;
 
-use crate::cache::{PatchInfo, UpdaterState};
+use crate::cache::{AssetsInstall, PatchInfo, UpdaterState};
 use crate::config::{set_config, with_config, UpdateConfig};
 use crate::download_state::{self, DownloadState};
 use crate::events::{EventType, PatchEvent};
@@ -501,6 +501,19 @@ fn update_internal(_: &UpdaterLockState, channel: Option<&str>) -> anyhow::Resul
         )
     })?;
 
+    // Download the optional asset-bundle artifact. Done outside the
+    // state lock so network I/O doesn't hold it; install_patch below
+    // still commits both artifacts atomically via a single call.
+    let assets_download = match patch.assets.as_ref() {
+        Some(a) => Some(download_and_verify_assets(
+            &config.network_hooks,
+            a,
+            &download_dir,
+            patch.number,
+        )?),
+        None => None,
+    };
+
     // We're abusing the config lock as a UpdateState lock for now.
     // This makes it so we never try to write to the UpdateState file from
     // two threads at once. We could give UpdateState its own lock instead.
@@ -508,9 +521,25 @@ fn update_internal(_: &UpdaterLockState, channel: Option<&str>) -> anyhow::Resul
         let patch_info = PatchInfo {
             path: output_path,
             number: patch.number,
+            assets_dir: None,
         };
+        // Borrow into AssetsInstall from the owned download tuple —
+        // the borrows are valid for this closure's scope.
+        let assets_install =
+            assets_download
+                .as_ref()
+                .map(|(path, hash, sig)| AssetsInstall {
+                    file_path: path.as_path(),
+                    hash: hash.as_str(),
+                    signature: sig.as_deref(),
+                });
         // Move/state update should be "atomic" (it isn't today).
-        state.install_patch(&patch_info, &patch.hash, patch.hash_signature.as_deref())?;
+        state.install_patch(
+            &patch_info,
+            &patch.hash,
+            patch.hash_signature.as_deref(),
+            assets_install,
+        )?;
         shorebird_info!(
             "Patch {} successfully downloaded. It will be launched when the app next restarts.",
             patch.number
@@ -623,10 +652,14 @@ fn clean_download_dir(download_dir: &Path, current_patch_number: usize) {
         let name = file_name.to_string_lossy();
 
         // Keep files that belong to the current patch:
-        //   "{number}", "{number}.full", "{number}.download.json"
+        //   "{number}"                   -- vmcode download
+        //   "{number}.full"              -- inflated vmcode
+        //   "{number}.download.json"     -- resume sidecar
+        //   "{number}.assets"            -- asset-bundle download
         if name == current_prefix
             || name == format!("{current_prefix}.full")
             || name == format!("{current_prefix}.download.json")
+            || name == format!("{current_prefix}.assets")
         {
             continue;
         }
@@ -641,6 +674,50 @@ fn clean_download_dir(download_dir: &Path, current_patch_number: usize) {
             }
         }
     }
+}
+
+/// Downloads the asset-bundle zip for a patch, validates its size and
+/// hash, and returns (local_path, hash, signature) ready to be wrapped
+/// in [`AssetsInstall`] and passed to `install_patch`.
+///
+/// On successful `install_patch`, the cache layer moves the file out
+/// of the download dir by rename. On failure, the file is removed.
+fn download_and_verify_assets(
+    network_hooks: &NetworkHooks,
+    assets: &crate::network::PatchAssets,
+    download_dir: &Path,
+    patch_number: usize,
+) -> Result<(PathBuf, String, Option<String>)> {
+    let assets_path = download_dir.join(format!("{patch_number}.assets"));
+    // No resume support for the asset bundle yet — always start fresh.
+    if assets_path.exists() {
+        let _ = fs::remove_file(&assets_path);
+    }
+    let dl = download_to_path(network_hooks, &assets.download_url, &assets_path, 0)?;
+    if let Some(expected) = dl.content_length {
+        if dl.total_bytes != expected {
+            let _ = fs::remove_file(&assets_path);
+            bail!(
+                "Asset-bundle download size mismatch: expected {} bytes, got {}",
+                expected,
+                dl.total_bytes
+            );
+        }
+    }
+    if let Err(e) = check_hash(&assets_path, &assets.hash) {
+        let _ = fs::remove_file(&assets_path);
+        return Err(e).with_context(|| {
+            format!(
+                "Asset-bundle hash mismatch; rejecting patch {}",
+                patch_number
+            )
+        });
+    }
+    Ok((
+        assets_path,
+        assets.hash.clone(),
+        assets.hash_signature.clone(),
+    ))
 }
 
 /// Removes the compressed download file and its sidecar after a successful
@@ -1223,6 +1300,7 @@ patch_verification: bogus_mode
                 hash: "bb8f1d041a5cdc259055afe9617136799543e0a7a86f86db82f8c1fadbd8cc45"
                     .to_string(),
                 hash_signature: None,
+                assets: None,
             }),
             rolled_back_patch_numbers: Some(vec![2]),
         };
@@ -1297,6 +1375,7 @@ patch_verification: bogus_mode
                 hash: "bb8f1d041a5cdc259055afe9617136799543e0a7a86f86db82f8c1fadbd8cc45"
                     .to_string(),
                 hash_signature: None,
+                assets: None,
             }),
             rolled_back_patch_numbers: Some(vec![2]),
         };
@@ -1584,6 +1663,7 @@ patch_verification: bogus_mode
                 download_url: "download_url".to_string(),
                 hash: "hash".to_string(),
                 hash_signature: None,
+                assets: None,
             }),
             rolled_back_patch_numbers: None,
         };
@@ -1633,6 +1713,7 @@ patch_verification: bogus_mode
                 hash: "#".to_string(),
                 download_url: "download_url".to_string(),
                 hash_signature: None,
+                assets: None,
             }),
             rolled_back_patch_numbers: None,
         };
@@ -1989,6 +2070,7 @@ patch_verification: bogus_mode
                 hash: "bb8f1d041a5cdc259055afe9617136799543e0a7a86f86db82f8c1fadbd8cc45"
                     .to_string(),
                 hash_signature: None,
+                assets: None,
             }),
             rolled_back_patch_numbers: None,
         };
@@ -2054,6 +2136,7 @@ patch_verification: bogus_mode
                         hash: "abc123".to_string(),
                         download_url: "http://example.com/patch/1".to_string(),
                         hash_signature: None,
+                        assets: None,
                     }),
                     rolled_back_patch_numbers: None,
                 })
@@ -2102,6 +2185,7 @@ patch_verification: bogus_mode
                 hash: "bb8f1d041a5cdc259055afe9617136799543e0a7a86f86db82f8c1fadbd8cc45"
                     .to_string(),
                 hash_signature: None,
+                assets: None,
             }),
             rolled_back_patch_numbers: None,
         };
@@ -2164,6 +2248,7 @@ patch_verification: bogus_mode
                 hash: "bb8f1d041a5cdc259055afe9617136799543e0a7a86f86db82f8c1fadbd8cc45"
                     .to_string(),
                 hash_signature: None,
+                assets: None,
             }),
             rolled_back_patch_numbers: None,
         };
@@ -2244,6 +2329,7 @@ patch_verification: bogus_mode
                 hash: "bb8f1d041a5cdc259055afe9617136799543e0a7a86f86db82f8c1fadbd8cc45"
                     .to_string(),
                 hash_signature: None,
+                assets: None,
             }),
             rolled_back_patch_numbers: None,
         };
@@ -2394,6 +2480,7 @@ mod rollback_tests {
                     .to_string(),
                 download_url: download_url.to_string(),
                 hash_signature: None,
+                assets: None,
             }),
             rolled_back_patch_numbers: Some(vec![3, 2]),
         };
@@ -2546,6 +2633,7 @@ mod rollback_tests {
                 hash: "bb8f1d041a5cdc259055afe9617136799543e0a7a86f86db82f8c1fadbd8cc45"
                     .to_string(),
                 hash_signature: None,
+                assets: None,
             }),
             rolled_back_patch_numbers: Some(vec![2]),
         };
@@ -2629,6 +2717,7 @@ mod check_for_downloadable_update_tests {
                 hash: "#".to_string(),
                 download_url: "download_url".to_string(),
                 hash_signature: None,
+                assets: None,
             }),
             rolled_back_patch_numbers,
         };
@@ -3114,6 +3203,7 @@ mod download_validation_tests {
                         hash: "abc123".to_string(),
                         download_url: "http://example.com/patch/1".to_string(),
                         hash_signature: None,
+                        assets: None,
                     }),
                     rolled_back_patch_numbers: None,
                 })
@@ -3161,6 +3251,7 @@ mod download_validation_tests {
                         hash: "abc123".to_string(),
                         download_url: "http://example.com/patch/1".to_string(),
                         hash_signature: None,
+                        assets: None,
                     }),
                     rolled_back_patch_numbers: None,
                 })
@@ -3209,6 +3300,7 @@ mod download_validation_tests {
                         hash: "abc123".to_string(),
                         download_url: "http://example.com/patch/1".to_string(),
                         hash_signature: None,
+                        assets: None,
                     }),
                     rolled_back_patch_numbers: None,
                 })
@@ -3300,6 +3392,185 @@ mod download_validation_tests {
         // Existing patch should still be intact.
         with_mut_state(|state| {
             assert_eq!(state.next_boot_patch().map(|p| p.number), Some(1));
+            Ok(())
+        })?;
+
+        Ok(())
+    }
+
+    /// Build a minimal asset-bundle zip in `temp_dir`, returning its
+    /// bytes and their sha256. The layout mirrors what the CLI will
+    /// eventually produce: files under `flutter_assets/`.
+    fn make_assets_zip(path: &Path, entries: &[(&str, &[u8])]) -> (Vec<u8>, String) {
+        use std::io::Write;
+        {
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (name, contents) in entries {
+                zip.start_file(*name, opts).unwrap();
+                zip.write_all(contents).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let bytes = std::fs::read(path).unwrap();
+        let hash = crate::cache::hash_file(path).unwrap();
+        (bytes, hash)
+    }
+
+    /// End-to-end: a patch-check response carrying both a vmcode and
+    /// an assets artifact drives `update()` through both downloads,
+    /// installs atomically, extracts the zip, and exposes the
+    /// extracted directory on the next boot patch's PatchInfo.
+    #[serial]
+    #[test]
+    fn update_installs_assets_alongside_code() -> Result<()> {
+        let mut server = mockito::Server::new();
+        let vmcode_url = format!("{}/patch/1", server.url());
+        let assets_url = format!("{}/assets/1", server.url());
+
+        let tmp_dir = TempDir::new().unwrap();
+        init_for_testing(&tmp_dir, Some(&server.url()));
+        // Base APK for the vmcode inflate step.
+        let base = "hello world";
+        let apk_path = tmp_dir.path().join("base.apk");
+        write_fake_apk(apk_path.to_str().unwrap(), base.as_bytes());
+
+        // Build the assets zip and capture its bytes + hash so the
+        // patch-check response hash matches what we serve.
+        let zip_src = tmp_dir.path().join("assets-source.zip");
+        let (assets_bytes, assets_hash) = make_assets_zip(
+            &zip_src,
+            &[("flutter_assets/hello.txt", b"hello from a patched asset")],
+        );
+
+        let check_response = PatchCheckResponse {
+            patch_available: true,
+            patch: Some(Patch {
+                number: 1,
+                download_url: vmcode_url.clone(),
+                // Generated by `string_patch "hello world" "hello tests"`
+                hash: "bb8f1d041a5cdc259055afe9617136799543e0a7a86f86db82f8c1fadbd8cc45"
+                    .to_string(),
+                hash_signature: None,
+                assets: Some(crate::network::PatchAssets {
+                    download_url: assets_url.clone(),
+                    hash: assets_hash,
+                    hash_signature: None,
+                }),
+            }),
+            rolled_back_patch_numbers: None,
+        };
+
+        let _ = server
+            .mock("POST", "/api/v1/patches/check")
+            .with_status(200)
+            .with_body(serde_json::to_string(&check_response).unwrap())
+            .create();
+        let _ = server
+            .mock("GET", "/patch/1")
+            .with_status(200)
+            .with_body(
+                // Generated by `string_patch "hello world" "hello tests"`
+                [
+                    40, 181, 47, 253, 0, 128, 177, 0, 0, 223, 177, 0, 0, 0, 16, 0, 0, 6, 0, 0, 0,
+                    0, 0, 0, 5, 116, 101, 115, 116, 115, 0,
+                ],
+            )
+            .create();
+        let _ = server
+            .mock("GET", "/assets/1")
+            .with_status(200)
+            .with_body(assets_bytes)
+            .create();
+        let _ = server
+            .mock("POST", "/api/v1/patches/events")
+            .with_status(201)
+            .create();
+
+        let result = crate::update(None)?;
+        assert_eq!(result, crate::UpdateStatus::UpdateInstalled);
+
+        with_mut_state(|state| {
+            let info = state.next_boot_patch().expect("next boot patch");
+            assert_eq!(info.number, 1);
+            let assets_dir = info.assets_dir.expect("assets_dir should be populated");
+            assert!(
+                assets_dir.join("flutter_assets/hello.txt").exists(),
+                "extracted asset file should exist at {}",
+                assets_dir.display()
+            );
+            let extracted = std::fs::read(assets_dir.join("flutter_assets/hello.txt")).unwrap();
+            assert_eq!(extracted, b"hello from a patched asset");
+            Ok(())
+        })?;
+
+        Ok(())
+    }
+
+    /// A bad assets hash must reject the entire patch atomically:
+    /// vmcode was downloaded and validated, but install_patch never
+    /// commits, so next_boot_patch remains `None`.
+    #[serial]
+    #[test]
+    fn update_rejects_patch_when_assets_hash_mismatches() -> Result<()> {
+        let mut server = mockito::Server::new();
+        let vmcode_url = format!("{}/patch/1", server.url());
+        let assets_url = format!("{}/assets/1", server.url());
+
+        let tmp_dir = TempDir::new().unwrap();
+        init_for_testing(&tmp_dir, Some(&server.url()));
+        let apk_path = tmp_dir.path().join("base.apk");
+        write_fake_apk(apk_path.to_str().unwrap(), b"hello world");
+
+        // Zip bytes whose real hash won't match the bogus hash we send.
+        let zip_src = tmp_dir.path().join("src.zip");
+        let (assets_bytes, _real_hash) =
+            make_assets_zip(&zip_src, &[("flutter_assets/x", b"y")]);
+
+        let check_response = PatchCheckResponse {
+            patch_available: true,
+            patch: Some(Patch {
+                number: 1,
+                download_url: vmcode_url,
+                hash: "bb8f1d041a5cdc259055afe9617136799543e0a7a86f86db82f8c1fadbd8cc45"
+                    .to_string(),
+                hash_signature: None,
+                assets: Some(crate::network::PatchAssets {
+                    download_url: assets_url,
+                    hash: "0".repeat(64), // wrong hash, right shape
+                    hash_signature: None,
+                }),
+            }),
+            rolled_back_patch_numbers: None,
+        };
+
+        let _ = server
+            .mock("POST", "/api/v1/patches/check")
+            .with_status(200)
+            .with_body(serde_json::to_string(&check_response).unwrap())
+            .create();
+        let _ = server
+            .mock("GET", "/patch/1")
+            .with_status(200)
+            .with_body(
+                [
+                    40, 181, 47, 253, 0, 128, 177, 0, 0, 223, 177, 0, 0, 0, 16, 0, 0, 6, 0, 0, 0,
+                    0, 0, 0, 5, 116, 101, 115, 116, 115, 0,
+                ],
+            )
+            .create();
+        let _ = server
+            .mock("GET", "/assets/1")
+            .with_status(200)
+            .with_body(assets_bytes)
+            .create();
+
+        let err = crate::update(None).unwrap_err();
+        assert!(format!("{err:#}").contains("Asset-bundle hash mismatch"));
+
+        with_mut_state(|state| {
+            assert!(state.next_boot_patch().is_none());
             Ok(())
         })?;
 
@@ -3434,6 +3705,7 @@ mod resume_edge_case_tests {
                         hash: PATCH_HASH.to_string(),
                         download_url: "http://example.com/patch/1".to_string(),
                         hash_signature: None,
+                        assets: None,
                     }),
                     rolled_back_patch_numbers: None,
                 })

@@ -261,6 +261,23 @@ pub extern "C" fn shorebird_next_boot_patch_path() -> *mut c_char {
     )
 }
 
+/// The path to the directory containing Flutter asset overrides for the
+/// next boot patch, or NULL if the patch has no assets (or there is no
+/// next patch). The directory layout mirrors the release's
+/// `flutter_assets/`, and the engine should consult this path first
+/// when resolving assets, falling back to the release bundle on miss.
+#[no_mangle]
+pub extern "C" fn shorebird_next_boot_assets_dir() -> *mut c_char {
+    log_on_error(
+        || {
+            let maybe_path = updater::next_boot_patch()?.and_then(|p| p.assets_dir);
+            path_to_c_string(maybe_path)
+        },
+        "fetching next_boot_assets_dir",
+        std::ptr::null_mut(),
+    )
+}
+
 /// Free a string returned by the updater library.
 /// # Safety
 ///
@@ -570,6 +587,7 @@ mod test {
         assert_eq!(shorebird_current_boot_patch_number(), 0);
         assert_eq!(shorebird_next_boot_patch_number(), 0);
         assert_eq!(shorebird_next_boot_patch_path(), null_mut());
+        assert_eq!(shorebird_next_boot_assets_dir(), null_mut());
 
         // Similarly we can report launches with no patch without crashing.
         shorebird_report_launch_start();
@@ -611,6 +629,7 @@ mod test {
                         hash: hash.to_owned(),
                         download_url: "ignored".to_owned(),
                         hash_signature: None,
+                        assets: None,
                     }),
                     rolled_back_patch_numbers: None,
                 })
@@ -645,6 +664,10 @@ mod test {
         unsafe { shorebird_free_string(c_path) };
         let new = std::fs::read_to_string(path).unwrap();
         assert_eq!(new, expected_new);
+
+        // The test patch-check response did not include an assets artifact,
+        // so the asset-override path must be absent.
+        assert_eq!(shorebird_next_boot_assets_dir(), null_mut());
     }
 
     #[serial]
@@ -679,6 +702,7 @@ mod test {
                         hash: hash.to_owned(),
                         download_url: "ignored".to_owned(),
                         hash_signature: None,
+                        assets: None,
                     }),
                     rolled_back_patch_numbers: None,
                 })
@@ -832,6 +856,7 @@ mod test {
                         hash: hash.to_owned(),
                         download_url: "ignored".to_owned(),
                         hash_signature: None,
+                        assets: None,
                     }),
                     rolled_back_patch_numbers: None,
                 })
@@ -883,6 +908,7 @@ mod test {
                         hash: hash.to_owned(),
                         download_url: "ignored".to_owned(),
                         hash_signature: None,
+                        assets: None,
                     }),
                     rolled_back_patch_numbers: None,
                 })
@@ -998,6 +1024,7 @@ mod test {
                         hash: "ignored".to_owned(),
                         download_url: "ignored".to_owned(),
                         hash_signature: None,
+                        assets: None,
                     }),
                     rolled_back_patch_numbers: None,
                 })

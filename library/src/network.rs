@@ -217,6 +217,30 @@ pub struct Patch {
     /// The signature of `hash`, if this patch is signed. None otherwise.
     #[serde(default)]
     pub hash_signature: Option<String>,
+    /// Optional second artifact carrying updated Flutter assets
+    /// (images, fonts, etc.) for this patch. Absent on patches that
+    /// only change Dart code — which is every patch predating asset
+    /// support, hence `#[serde(default)]`.
+    #[serde(default)]
+    pub assets: Option<PatchAssets>,
+}
+
+/// Description of the asset-bundle artifact for a patch.
+///
+/// Wire shape mirrors [`Patch`]: a content hash, its signature, and a
+/// URL to fetch the bytes from. The bytes themselves are a zip of the
+/// asset delta (added+changed files under `flutter_assets/`, plus a
+/// `.removed` manifest of paths to shadow from the release bundle).
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PatchAssets {
+    /// The hex-encoded sha256 hash of the downloaded (still-compressed)
+    /// asset-bundle file.
+    pub hash: String,
+    /// The URL to download the asset bundle from.
+    pub download_url: String,
+    /// The signature of `hash`, if this patch is signed. None otherwise.
+    #[serde(default)]
+    pub hash_signature: Option<String>,
 }
 
 /// Any edits to this struct should be made carefully and in accordance
@@ -345,6 +369,33 @@ mod tests {
         assert_eq!(patch.number, 1);
         assert_eq!(patch.download_url, "https://storage.googleapis.com/patch_artifacts/17a28ec1-00cf-452d-bdf9-dbb9acb78600/dlc.vmcode");
         assert_eq!(patch.hash, "1234");
+        // Old responses have no `assets` field; it should deserialize as None.
+        assert!(patch.assets.is_none());
+    }
+
+    #[test]
+    fn patch_response_with_assets_deserializes() {
+        let data = r#"
+    {
+        "patch_available": true,
+        "patch": {
+            "number": 2,
+            "download_url": "https://example.com/dlc.vmcode",
+            "hash": "vmcode-hash",
+            "assets": {
+                "download_url": "https://example.com/dlc.assets",
+                "hash": "assets-hash",
+                "hash_signature": "sig"
+            }
+        }
+    }"#;
+
+        let response: PatchCheckResponse = serde_json::from_str(data).unwrap();
+        let patch = response.patch.unwrap();
+        let assets = patch.assets.expect("assets should be present");
+        assert_eq!(assets.download_url, "https://example.com/dlc.assets");
+        assert_eq!(assets.hash, "assets-hash");
+        assert_eq!(assets.hash_signature.as_deref(), Some("sig"));
     }
 
     #[test]

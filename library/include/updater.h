@@ -155,6 +155,15 @@ void shorebird_validate_next_boot_patch(void);
 SHOREBIRD_EXPORT char *shorebird_next_boot_patch_path(void);
 
 /**
+ * The path to the directory containing Flutter asset overrides for the
+ * next boot patch, or NULL if the patch has no assets (or there is no
+ * next patch). The directory layout mirrors the release's
+ * `flutter_assets/`, and the engine should consult this path first
+ * when resolving assets, falling back to the release bundle on miss.
+ */
+SHOREBIRD_EXPORT char *shorebird_next_boot_assets_dir(void);
+
+/**
  * Free a string returned by the updater library.
  * # Safety
  *
